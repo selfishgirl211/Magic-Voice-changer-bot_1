@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""
+Telegram Voice-Changer Bot (single file)
+-- Token included below as requested (but revoke/regenerate if it's public!)
+Requirements (install these):
+pip install python-telegram-bot==20.6 numpy librosa soundfile pydub
+
+ffmpeg must be installed and in PATH (for pydub/encoding).
+"""
+
+# ------------------ EDITABLE: your token is placed here ------------------
+TOKEN = "8452129575:AAEHvzAiYEhZHXNWcVvTGjYK7GQS-glUpak"
+# -------------------------------------------------------------------------
+
+import logging
+import tempfile
+import shutil
+import traceback
+from pathlib import Path
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+
+import numpy as np
+import soundfile as sf
+import librosa
+from pydub import AudioSegment
+
+# ---------- logging ----------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ---------- effects ----------
+EFFECTS = {
+    "pitch_up": "Pitch Up (Chipmunk-ish)",
+    "pitch_down": "Pitch Down (Deep)",
+    "speed_up": "Speed Up",
+    "slow": "Slow",
+    "robot": "Robot",
+    "chipmunk": "Chipmunk",
+    "deep": "Deep",
+}
+
+# ---------- audio helpers ----------
+def ogg_to_wav(ogg_path: str, wav_path: str) -> None:
+    """Convert OGG/OPUS to WAV using ffmpeg via pydub."""
+    AudioSegment.from_file(ogg_path).export(wav_path, format="wav")
+
+def wav_to_ogg(wav_path: str, ogg_path: str) -> None:
+    """Convert WAV to OGG/OPUS (voice note format)."""
+    AudioSegment.from_file(wav_path, format="wav").export(
+        ogg_path, format="ogg", parameters=["-acodec", "libopus"]
+    )
+
+def normalize_audio(y: np.ndarray) -> np.ndarray:
+    peak = np.max(np.abs(y)) if y.size else 0.0
+    if peak > 0:
+        return y / (peak + 1e-9) * 0.99
+    return y
+
+def apply_pitch_shift(y: np.ndarray, sr: int, n_steps: float) -> np.ndarray:
+    return librosa.effects.pitch_shift(y, sr, n_steps=n_steps)
+
+def apply_time_stretch(y: np.ndarray, rate: float) -> np.ndarray:
+    # librosa expects float
+    return librosa.effects.time_stretch(y, rate)
+
+def apply_robotic(y: np.ndarray, sr: int, carrier_freq: float = 30.0) -> np.ndarray:
+    t = np.arange(len(y)) / float(sr)
+    carrier = np.sin(2.0 * np.pi * carrier_freq * t)
+    return y * carrier
+
+def process_audio_effect(in_wav: str, out_wav: str, effect: str) -> None:
+    # load original audio (preserve sample rate)
+    y, sr = librosa.load(in_wav, sr=None, mono=True)
+    if effect == "pitch_up":
+        y2 = apply_pitch_shift(y, sr, n_steps=5)
+    elif effect == "pitch_down":
+        y2 = apply_pitch_shift(y, sr, n_steps=-5)
+    elif effect == "speed_up":
+        y2 = apply_time_stretch(y, 1.5)
+    elif effect == "slow":
+        y2 = apply_time_stretch(y, 0.75)
+    elif effect == "robot":
+        y2 = apply_robotic(y, sr, carrier_freq=40.0)
+    elif effect == "chipmunk":
+        y_tmp = apply_time_stretch(y, 1.4)
+        y2 = apply_pitch_shift(y_tmp, sr, n_steps=3)
+    elif effect == "deep":
+        y_tmp = apply_time_stretch(y, 0.9)
+        y2 = apply_pitch_shift(y_tmp, sr, n_steps=-3)
+    else:
+        y2 = y
+
+    y2 = normalize_audio(y2)
+    sf.write(out_wav, y2, sr)
+
+# ---------- Telegram handlers ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "Assalamualaikum! Main VoiceChanger Bot hoon.\n\n"
+        "Aap mujhe voice note bhejein, phir effect choose karein.\n"
+        "Commands: /start /help"
+    )
+    await update.message.reply_text(text)
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Voice note bhejein (max 60s). Phir effect choose karne ke liye buttons aayenge."
+    )
+
+async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.voice:
+        await msg.reply_text("Please send a voice note (voice message).")
+        return
+
+    # small guard to avoid very long processing
+    dur = getattr(msg.voice, "duration", None)
+    if dur and dur > 60:
+        await msg.reply_text("Voice note bohat lambi hai — maximum 60 seconds allowed.")
+        return
+
+    file = await context.bot.get_file(msg.voice.file_id)
+
+    # create persistent temp dir (so callback can access files)
+    tmpdir_path = Path(tempfile.mkdtemp(prefix="vc-"))
+    ogg_path = tmpdir_path / "in.ogg"
+    wav_path = tmpdir_path / "in.wav"
+
+    try:
+        await file.download_to_drive(str(ogg_path))
+    except Exception as e:
+        logger.exception("Download failed")
+        await msg.reply_text("Failed to download voice note.")
+        shutil.rmtree(tmpdir_path, ignore_errors=True)
+        return
+
+    # convert ogg -> wav
+    try:
+        ogg_to_wav(str(ogg_path), str(wav_path))
+    except Exception as e:
+        logger.exception("ogg->wav conversion failed (ffmpeg required)")
+        await msg.reply_text("Conversion error — ffmpeg is required on the server.")
+        shutil.rmtree(tmpdir_path, ignore_errors=True)
+        return
+
+    # store for later callback processing
+    context.user_data["vc_tmpdir"] = str(tmpdir_path)
+    context.user_data["vc_wav"] = str(wav_path)
+
+    # build keyboard (2 columns)
+    keyboard = []
+    row = []
+    for i, (k, v) in enumerate(EFFECTS.items(), start=1):
+        row.append(InlineKeyboardButton(v, callback_data=f"effect|{k}"))
+        if i % 2 == 0:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await msg.reply_text("Select effect:", reply_markup=reply_markup)
+
+async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    data = query.data or ""
+    if not data.startswith("effect|"):
+        await query.edit_message_text("Unknown action.")
+        return
+
+    effect = data.split("|", 1)[1]
+    tmpdir = context.user_data.get("vc_tmpdir")
+    wav_in = context.user_data.get("vc_wav")
+    if not tmpdir or not wav_in or not Path(wav_in).exists():
+        await query.edit_message_text("Original voice expired — please send the voice note again.")
+        # clean just in case
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        context.user_data.pop("vc_tmpdir", None)
+        context.user_data.pop("vc_wav", None)
+        return
+
+    await query.edit_message_text(f"Processing: {EFFECTS.get(effect, effect)} ... (please wait)")
+
+    out_wav = Path(tmpdir) / "out.wav"
+    out_ogg = Path(tmpdir) / "out.ogg"
+
+    try:
+        process_audio_effect(wav_in, str(out_wav), effect)
+        wav_to_ogg(str(out_wav), str(out_ogg))
+    except Exception as e:
+        logger.exception("Processing failed")
+        await query.edit_message_text("Processing failed: " + str(e))
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        context.user_data.pop("vc_tmpdir", None)
+        context.user_data.pop("vc_wav", None)
+        return
+
+    # send resulting voice note
+    try:
+        with open(out_ogg, "rb") as fh:
+            await context.bot.send_voice(chat_id=update.effective_chat.id, voice=fh)
+        await query.edit_message_text(f"Done — effect: {EFFECTS.get(effect)}")
+    except Exception as e:
+        logger.exception("Send failed")
+        await query.edit_message_text("Failed to send processed voice: " + str(e))
+    finally:
+        # cleanup
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        context.user_data.pop("vc_tmpdir", None)
+        context.user_data.pop("vc_wav", None)
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Update caused error: %s", context.error)
+    try:
+        if isinstance(update, Update) and update.message:
+            await update.message.reply_text("An unexpected error occurred. Try again later.")
+    except Exception:
+        pass
+
+def main():
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(MessageHandler(filters.VOICE, on_voice))
+    app.add_handler(CallbackQueryHandler(on_callback_query))
+    app.add_error_handler(error_handler)
+    logger.info("Bot starting (polling)...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
